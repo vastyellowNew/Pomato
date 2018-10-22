@@ -1,0 +1,40 @@
+set(EXTRA_SRC
+	${XAVIER_DIR}/maps/map_analysis
+)
+add_library(topo ${EXTRA_SRC})
+
+set(TEST_SRC
+	cr3bp_plot
+	computeMapOC
+	computeMapOC_Apse
+	computeMapOC_yL4
+	computeMapOC_thetaL4
+	pmateMergeFPData
+	pmateTabulateFPX
+	pmateAdaptiveGrid
+	pmateTopologyExtraction
+	pmateManifoldCreator
+	test_MultipleShooting
+	test_fpICgrid
+	plot_winding2
+	plot_winding_Avizo
+	test_Monodromy
+	test_SaddleMan
+	test_AstroManifold
+	test_TaskScheduling
+	testIntersection
+	writeOCLatexFigs
+)
+#Others - need to be updated!
+#cr3bp_analysis
+#plot_winding
+#test_wnAdaptiveGrid
+
+foreach(target ${TEST_SRC})
+	add_executable(${target} ${target}.cpp)
+	target_link_libraries(${target} topo
+        ${GLUT_LIBRARIES}
+        ${OPENGL_LIBRARIES}
+        ${GLUI_LIBRARIES}
+        ${Teem_LIBRARIES} )
+endforeach(target ${TEST_SRC})

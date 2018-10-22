@@ -1,0 +1,458 @@
+/////////////////////////////////////////////////////////////////
+//  MultipleShooting header file
+//  Author:  Wayne Schlei
+//  Date: 12/7/2012
+//
+//  Purpose:  For differential corrections procedures using 
+//  multiple shooting.  (Fixed-point computation)
+/////////////////////////////////////////////////////////////////
+#ifndef MULTIPLE_SHOOTING_HPP
+#define MULTIPLE_SHOOTING_HPP
+
+//Useful elements
+#include <vector>
+#include <iostream>
+#include <complex>
+#include <math/fixed_vector.hpp>
+#include <math/fixed_matrix.hpp>
+
+//EIGEN API
+#include <Eigen/Core>
+#include <Eigen/Dense>
+#include <Eigen/Sparse>
+
+//API for Maps
+#include <cr3bp/poincare_map.hpp>
+#include <cr3bp/section.hpp>
+#include <maps/fixpoints.hpp>
+
+using namespace Eigen;
+using namespace xavier;
+
+namespace orbital {
+
+//Corrections Data
+struct CorrectionResult {
+	CorrectionResult(bool success, int numIters, double error) :
+		converged(success), iterations(numIters), normF(error) {}
+	CorrectionResult() : converged(false), iterations(0), normF(100.0) {}
+	
+	bool   	converged;
+	int 	iterations;
+	double	normF;
+};
+
+/// Class for a Periodic Orbit: With Hamiltonain, Dist-to-Section, and Periodicity constraints
+template<typename MAP>
+class PeriodicOrbit {
+  public :
+    /// Type defs
+    typedef typename MAP::value_type				value_type;
+    typedef typename MAP::rhs_type::state_type			state_type;
+    typedef typename MAP::xstate_type				xstate_type;
+    typedef typename MAP::rhs_type				rhs_type;
+    typedef typename MAP::section_type				section_type;
+    typedef typename MAP::section_type::lvec_type		lvec_type;
+    typedef typename MAP::section_type::lmat_type		lmat_type;
+    typedef typename MAP::section_type::gvec_type		gvec_type;
+    typedef typename MAP::section_type::gmat_type		gmat_type;
+    typedef typename MAP::return_type				return_type;
+    typedef typename MAP::return_state				return_state;
+    typedef typename MAP::return_state::mat_type		return_mat;
+    typedef typename MAP::solver_type				solver_type;
+    typedef typename MAP::solver_type::step			step_type;
+    typedef Eigen::Triplet<double>				Triple;
+    typedef Eigen::SparseMatrix<double>				SpMat;
+    
+    /// Constructors
+    PeriodicOrbit(const MAP& pmap, lvec_type& x0, value_type Hval, int numCross, int ptsPerCross=8, bool verbose=false) : 
+	_verbose(verbose), _x0(x0), _p(numCross), _ptsPerp(ptsPerCross), 
+	_k(ptsPerCross*numCross), _maxIters(20), _tol(1.e-8), _prec(1.e-12), 
+	theMap(pmap)
+	{
+		theMap.precision() = _prec;
+		//Run setGuess to setup parameters
+	}
+    
+    //Parameters:
+    /// Maximum iterations
+    void setMaxIters(int maxIters) {_maxIters = maxIters;}
+    /// Convergence Tolerance
+    void setTolerance(double tol) {_tol = tol;}
+    /// Period (if you know it)
+    void setPeriod(double T) {_period = T;}
+    /// Precision of integration
+    void setPrecision(double prec) {
+	_prec = prec;
+	theMap.precision() = _prec;
+    }
+
+    /// Set an initial guess
+    void setGuess(const lvec_type& x0, const value_type Hdesired, int numCross) {
+	//Set parameters
+	_x0 = x0;
+	_desired_H = Hdesired;
+	_p = numCross;
+	_k = _ptsPerp*_p;
+
+	//Run the map to find the period(time) of the orbit
+	//->Map x0 for p iterates
+	_period = 0.0;
+	return_type r = theMap.map_complete(_x0, _p);
+	_period += r.t;
+	
+    }
+    
+    /// Run corrections process
+    CorrectionResult correct();
+    
+    /// Set fixed-point information
+    void setFixedPoints(fixpoint& fp, std::vector<nvis::vec2>& iterates) {
+	//Assume the fixed point is found (fp is initial fixed point)
+	fp.pos = _x0;
+    	fp.K = _p;
+	//Run map to get full state and STM at each return
+	std::vector<return_state> stateInfoPerReturn;
+	theMap.map_complete(fp.pos,stateInfoPerReturn,fp.K);
+	return_mat stm = stateInfoPerReturn[_p-1].J;
+	//Full-state STM
+	const int& n = rhs_type::dimension;
+	MatrixXd monodromy(n,n);
+	for(int i=0;i<n;i++) {
+		for (int j=0;j<n;j++) {
+			monodromy(i,j) = stateInfoPerReturn[_p-1].J[i][j];
+		}
+	}
+	//Run Eigen Values/vectors
+	EigenSolver<MatrixXd> eigenSolver(monodromy); //Runs the eigen val/vector problem
+	//if (eigenSolver.info() != Success) throw std::cerr << "Eigen Solver Crash\n";
+	VectorXcd v_s, v_u, eigs;
+	v_s.resize(n); v_u.resize(n); eigs.resize(n);
+	//For each eigen value, see if there is a reciprocal pair
+	std::map<int,int> eigenPairs;
+	for (int i=0;i<n;i++) {
+		complex<double> lambda = eigenSolver.eigenvalues()[i];
+		for (int j=0;j<n;j++) {
+		   complex<double> lambda2 = eigenSolver.eigenvalues()[j];
+		   if( abs(abs(lambda*lambda2) - 1.0) < 1.e-8)  eigenPairs[i] = j;
+		}
+	}
+	//Test if saddle	
+	VectorXd::Index maxEigIdx,dummy;
+	eigs = eigenSolver.eigenvalues();
+	// Transform into just a vector of reals
+	VectorXd eigsReal(n);
+	for (int i=0;i<n;i++) eigsReal[i] = real(eigs[i]);
+	double maxEigVal = eigsReal.maxCoeff(&maxEigIdx,&dummy);
+	// HARD CODED FOR CR3BP 6D->2D y=0 with [x,xdot]
+	if (abs(log(maxEigVal)) >= 0.01) {
+		fp.saddle = true;
+		v_u = eigenSolver.eigenvectors().col(maxEigIdx);
+		v_s = eigenSolver.eigenvectors().col(eigenPairs[maxEigIdx]);
+		fp.evec[0] = nvis::vec2(real(v_s[0]),real(v_s[3]));//Stable
+		fp.eval[0] = log(1.0/maxEigVal); //Stable
+		fp.evec[1] = nvis::vec2(real(v_u[0]),real(v_u[3]));//Unstable
+		fp.eval[1] = log(maxEigVal); //Unstable
+	} else {
+		//Center type
+		fp.saddle = false;
+		fp.eval[0] = 0.0;
+		fp.eval[1] = 0.0;
+	}
+
+	
+	//The iterates: 
+	iterates[0] = fp.pos;
+	for (int i=1;i<_p;i++) {
+		std::pair<lvec_type,lmat_type> pr =  theMap.section().project(stateInfoPerReturn[i].getState());
+		iterates[i] = pr.first;
+	}
+	//if (fp.saddle) {
+	//	//If saddle, transform Eigen vectors with STM
+	//	for(int pp = 0; pp< _p-1; pp++) {
+	//		MatrixXd stm0_to_p(n,n);
+	//		for(int i=0;i<n;i++) {
+	//		  for (int j=0;j<n;j++) {
+	//		    stm0_to_p(i,j) = stateInfoPerReturn[pp].J[i][j];
+	//		  }
+	//		}	
+	//
+	//		//Transform Eigen Vectors
+	//	}
+	//} else {
+	//	//Center:  Just record values
+	//}
+
+    }
+    
+  private :
+    /// Initialize:  Run the IC to fill out X
+    void initialize() {
+	const int& n = rhs_type::dimension;
+	//Initialize sizes
+	X.resize(n*_k+1);
+	F.resize(n*_k+1);
+	dX.resize(n*_k+1);
+
+	//Run integration to fill out X
+	xstate_type y0 = theMap.section().unproject(_x0);
+	return_state stateInfo(y0,0.0);
+	for (int i=0; i<_k; i++) {
+		xstate_type y = stateInfo.getState();
+		stateInfo = theMap.integrate_state(y,_period/(double)_k);
+		for(int j=0;j<n;j++) X(n*j+i) = stateInfo.x[j];
+	}
+	//Last entry is the period guess
+	X(n*_k) = _period;
+	//Set the size of coefficients
+	coeffsDF.resize(n*(_k-1) + n-1 + n*n*(_k-1) + n*(n-1) + n*(_k-1) + n-1 + n + n);
+	//-I's for continuity
+	int idx = 0;
+	for(int kk=0; kk<(_k-1); kk++) {
+		coeffsDF[idx] = Triple(kk,n*(kk+1),-1.0);
+		idx++;
+	}
+	//-1's for periodicity (n-1)
+	for(int kk=0; kk<(n-2); kk++) {
+		coeffsDF[idx] = Triple(n*(_k-1)+kk,kk,-1.0);
+		idx++;
+	}
+	coeffsDF[idx] = Triple(n*(_k-1)+(n-2),n-1,-1.0);
+	if (_verbose) {
+		std::cerr << " Fixed coeffsDF = \n";
+		int idx1 = n*(_k-1)+(n-1);
+		for (int i=0;i<idx1;i++) std::cerr << "   (" << i 
+			<< ") = (" << coeffsDF[i].row() << ", "
+				  << coeffsDF[i].col() << ") "
+			<< " = " << coeffsDF[i].value() << "\n";
+	}
+	//The rest of the triples are set with computeF_and_DF();
+	
+    }
+
+
+    /// Compute F and DF given X
+    void computeF_and_DF();
+    bool _verbose;
+    lvec_type _x0; //intitial guess
+    int _p; //Number of crossings
+    int _ptsPerp; //Patch points per crossing
+    int _k; //Num Patch points
+    int _maxIters;
+    double _tol;  //Convergence Tolerance
+    double _prec; //Integration precision
+    MAP theMap;   //The Poincare map (with RHS, ODESolver, and Section)
+    double _desired_H; //The desired Energy value
+    double _period; //Time
+
+    //Parameters for multi-dim problem
+    VectorXd X,F,dX; //Free-variables, Constraints, Newton-Step
+    std::vector<Triple> coeffsDF;
+    //SparseMatrix<double> DF; //Jacobian Matrix (Typically sparse)
+};
+
+///The correction function for PeriodicOrbit
+template<typename MAP>
+CorrectionResult PeriodicOrbit<MAP>::correct()
+{
+	//Initialize the run by computing X,F,DF for initial guess
+	initialize();
+	SparseMatrix<double> DF; //Initialize, column-major order
+	const int& n = theMap.rhs().dimension;
+	DF.resize(n*_k+2,n*_k+2);
+	double normF = 1000.0;
+	int count = 0;
+	bool succeed = true;
+	//Main Loop
+	while (normF > _tol) {
+		//Compute F and DF
+		computeF_and_DF(); //Will change F and DF given current X
+		DF.setFromTriplets(coeffsDF.begin(),coeffsDF.end());
+		normF = sqrt(F.dot(F));
+
+		//Iters
+		if (count >= _maxIters) {
+			succeed = false;
+			break;
+		}
+		//F grew too big
+		if (normF > 1.0) {
+			succeed = false;
+			break;
+		}		
+		count++;
+		//Solve for dX
+		//dX = DF.householderQR().solve(-F); //Non-sparse implementation
+		SimplicialCholesky<SpMat> chol(DF);
+		dX = chol.solve(-F);
+		//Update
+		X += dX;
+	}
+	
+	//Store result
+	if (succeed) {
+		_period = X(n*_k);
+		gvec_type x0(0);
+		for (int i=0;i<n;i++) x0[i] = X(i);
+		std::pair<lvec_type, lmat_type> x0pair = theMap.section().project(x0);
+		_x0 = x0pair.first;
+	}
+	CorrectionResult result(succeed,count,normF);
+	return result;
+}
+
+/// Compute F and DF given X
+template<typename MAP>
+void PeriodicOrbit<MAP>::computeF_and_DF() {
+	const int& n = theMap.rhs().dimension;
+	//Integrate Each state
+	double dt = X(n*_k)/_k; //Last entry is time 
+
+	//For each patch point -> We could multi-thread this??
+	for(int kk=0; kk<_k; kk++) {
+		xstate_type y0(0.0);
+		for (int i=0;i<n;i++) y0[i] = X(n*kk+i);
+		for (int i=0;i<n;i++) y0[n+n*i+i] = 1.0; //Identity for STM0
+		//Run the state through dt time
+		return_state finalInfo = theMap.integrate_state(y0,dt);
+		xstate_type yf = finalInfo.getState();
+		//STM = finalInfo.J
+		//State derivative
+		const rhs_type& rhs = theMap.rhs();
+		xstate_type dxdt = rhs(0.0,yf);
+
+		//Partials/constraints relevant to first point
+		if (kk == 0) {
+			int idx = n*(_k-1)+(n-1) + n*n*(_k-1) + n*(n-1) + n*(_k-1) + (n-1); //Idx5
+			//Section Distance constraint
+			F(n*_k - 1) = theMap.section().distance(y0);
+			xstate_type sectPartials = theMap.section().distance_first_partials(y0);
+			for (int i=0;i<n;i++) {
+				coeffsDF[idx] = Triple(n*_k - 1,i,sectPartials[i]);
+				idx++;
+			}
+			//Hamiltonian Constraint
+			F(n*_k) = theMap.rhs().hamiltonian(0.0,y0) - _desired_H;
+			state_type hPartials = theMap.rhs().hamiltonian_first_partials(0.0,y0);
+			for (int i=0;i<n;i++) {
+				coeffsDF[idx] = Triple(n*_k,i,hPartials[i]);
+				idx++;
+			}
+		}
+
+		if (kk < _k-1) {
+			//Continuity Constraints
+			for (int i=0;i<n;i++) F(n*kk+i) = yf[i] - X(n*(kk+1)+i);
+			//DF entries
+			int idx = n*(_k-1)+(n-1); //Idx1
+			for (int i = 0;i<n;i++) {
+			  for (int j=0;j<n;j++) {
+				coeffsDF[idx] = Triple(n*kk+j,n*(kk+1)+i,  finalInfo.J[j][i]);
+				idx++;
+			  }
+			}
+			//State derivative
+			idx = n*(_k-1)+(n-1) + n*n*(_k-1) + n*(n-1); //Idx3
+			for (int i=0;i<n;i++) {
+			  coeffsDF[idx] = Triple(n*kk+i,n*_k, dxdt[i]);
+			  idx++;
+			}
+		} else {
+			//Periodicity for kk==_k-1
+			for (int i=0;i<n-2;i++) F(n*kk+i) = yf[i] - X(i);
+			F(n*kk+n-2) = yf[n-1] - X(n-1);
+			//DF entries
+			int idx = n*(_k-1)+(n-1) + n*n*(_k-1); //Idx2
+			for (int i=0;i<n;i++) {
+			  for (int j=0;j<n-2;j++) {
+			  	coeffsDF[idx] = Triple(n*kk+j,n*(kk+1)+i, finalInfo.J[j][i]);
+				idx++;
+			  }
+			}
+			for (int i=0;i<n;i++) { //Last STM row
+				coeffsDF[idx] = Triple(n*kk+n-2,n*(kk+1)+i, finalInfo.J[n-1][i]);
+				idx++;
+			}
+			//State Derivs
+			idx = n*(_k-1)+(n-1) + n*n*(_k-1) + n*(n-1) + n*(_k-1); //Idx4
+			for (int i=0;i<n-2;i++) {
+			   coeffsDF[idx] = Triple(n*kk+i,n*_k,dxdt[i]);
+			   idx++;
+			}
+			coeffsDF[idx] = Triple(n*kk+n-2,n*_k,dxdt[n-1]);
+		}
+
+		
+	}
+
+}//end computeF_and_DF();
+
+
+/// The replacement for meta_newton:
+///   Use Multiple Shooting to solve for Fixed points in higher dimensional or sensitive systems
+template<typename MAP>
+bool MultipleShooting_SolveFP(const MAP& pmap, const metric<double,2>& metric, const nvis::bbox2& bounds,
+	const nvis::vec2& first_guess, double Hval, int depth, int period, fixpoint& fp, 
+	std::vector<nvis::vec2>& iterates, double eps, bool verbose = false, size_t maxiter=20)
+{
+	typedef rhs_only_wrapper<MAP,2> simple_residual;
+
+	simple_residual err(pmap, metric, period);
+	iterates.resize(period);
+	nvis::vec2 x = first_guess, ferr;
+	try {
+		ferr = err(x);
+	} catch(...) {
+		return false;
+	}
+
+	//See if we can improve the seed point 
+	if (nvis::norm(ferr) > eps) 
+	{
+		if (verbose) {
+			std::cerr << "norm at seed point (" << first_guess << ") = " << nvis::norm(ferr) << " is too large\n";
+		}
+		//Run the seed check
+		bool ok = find_seed(err, metric, bounds, x, depth);
+		if (!ok) {
+			if (verbose) {
+				std::cerr << "Unable to find seed\n";
+			}
+			return false;
+		}
+		else if (verbose) {
+			std::cerr << "  improved seed found:\n"
+				<< "norm at new seed (" << x << ") is " << nvis::norm(err(x)) << "\n";
+		}
+	}
+
+	//Run the corrections algorithm
+	PeriodicOrbit<MAP> corrector(pmap, x, Hval, period);
+	corrector.setMaxIters(maxiter);
+	corrector.setTolerance(eps);
+	CorrectionResult theResult = corrector.correct();
+	bool found = theResult.converged;
+	if (!found) {
+		return false;
+	}
+	if (!bounds.inside(x)) {
+		//Do something if we travel outside bounds
+	} else {
+	}
+
+	try {
+		if (found) {
+			//Compute the map iterates and Jacobian
+			corrector.setFixedPoints(fp,iterates);
+		}			
+	} catch(...) {
+		return false;
+	}
+
+	//If no errors,
+	return true;
+} //We may want this in the "main" cr3bp_analysis function (multipleDefs?)
+
+}//namespace orbital
+
+#endif //MultipleShooting

@@ -1,0 +1,7 @@
+system: Jupiter-Europa
+mu: 2.528017682687079e-05
+P1_radius: 0.1065
+P2_radius: 0.002326
+P1_image: 2k_jupiter.jpg
+P2_image: Europa_small.jpg
+path: /home/xmt/code/pmate/resources/images
