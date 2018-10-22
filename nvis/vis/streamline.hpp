@@ -1,3 +1,14 @@
+/*************************************************************************
+* nvis: "no name visualization": suite of handy data structures and
+*       agorithmic building blocks for scientific visualization.
+*
+* Author: Christoph Garth, University of Kaiserslautern
+*
+* Copyright (C) 2006 Christoph Garth
+*
+*************************************************************************/
+
+
 #ifndef __streamline_hpp
 #define __streamline_hpp
 
