@@ -1,4 +1,6 @@
 # Pomato
+*POincare MAp TOpology extraction*
+
 **Automatic extraction and visualization of the topology of 2D Poincaré maps in the circular restricted three-body problem.**
 
 This library offers a suite of tools to extract the fixed point and invariant manifolds of the Poincare map in the circular restricted three-body problem (CR3BP). 
